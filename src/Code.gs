@@ -1,4 +1,6 @@
 /**
+ * @OnlyCurrentDoc
+ *
  * blog-auto-gas / src/Code.gs
  *
  * シート「記事」を使ったブログ記事自動生成・投稿の土台。
