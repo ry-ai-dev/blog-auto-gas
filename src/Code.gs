@@ -116,7 +116,7 @@ function generateForSelectedRow() {
     try {
       const prompt = buildPrompt(keyword, subKeyword, sampleArticle);
       const apiResult = callClaudeApi(prompt);
-      const article = extractJsonFromText(apiResult.text);
+      const article = extractJsonFromText(apiResult.text, apiResult.stopReason);
 
       const bodyText = article && typeof article.content_html === 'string'
         ? stripHtmlTags(article.content_html)
@@ -218,8 +218,9 @@ function buildPrompt(keyword, subKeyword, sampleArticle) {
 
 /**
  * Claude API (Messages API) を呼び出し、生成テキストとトークン使用量、所要時間を返す。
+ * content配列のうちtypeが'text'のブロックはすべて連結して本文とする(先頭要素のみに限定しない)。
  * @param {string} prompt 送信するプロンプト
- * @return {{text: string, usage: {input_tokens: number, output_tokens: number}, elapsedSeconds: number}}
+ * @return {{text: string, usage: {input_tokens: number, output_tokens: number}, elapsedSeconds: number, stopReason: string}}
  */
 function callClaudeApi(prompt) {
   const apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
@@ -260,22 +261,60 @@ function callClaudeApi(prompt) {
   try {
     responseJson = JSON.parse(httpResponse.getContentText());
   } catch (e) {
-    throw new Error('Claude APIの応答を解析できませんでした。');
+    throw new Error('Claude APIの応答を解析できませんでした(HTTP ' + responseCode + ')。');
   }
 
-  const text = (responseJson.content && responseJson.content[0] && responseJson.content[0].text) || '';
+  const contentBlocks = Array.isArray(responseJson.content) ? responseJson.content : [];
+  const text = contentBlocks
+    .filter(function (block) { return block && block.type === 'text' && typeof block.text === 'string'; })
+    .map(function (block) { return block.text; })
+    .join('');
+
+  const stopReason = responseJson.stop_reason || '不明';
   const usage = responseJson.usage || { input_tokens: 0, output_tokens: 0 };
 
-  return { text: text, usage: usage, elapsedSeconds: elapsedSeconds };
+  if (!text) {
+    throw new Error(buildEmptyResponseErrorMessage(responseCode, stopReason, contentBlocks, usage));
+  }
+
+  return { text: text, usage: usage, elapsedSeconds: elapsedSeconds, stopReason: stopReason };
+}
+
+/**
+ * 本文が空だった場合のエラーメッセージを組み立てる。
+ * APIキーやヘッダーなど秘密情報は含めず、原因調査に使える情報(HTTPステータス・stop_reason・
+ * contentのtype一覧・usage)のみを含める。
+ * @param {number} responseCode HTTPステータスコード
+ * @param {string} stopReason レスポンスのstop_reason
+ * @param {Array} contentBlocks レスポンスのcontent配列
+ * @param {{input_tokens: number, output_tokens: number}} usage トークン使用量
+ * @return {string} エラーメッセージ
+ */
+function buildEmptyResponseErrorMessage(responseCode, stopReason, contentBlocks, usage) {
+  const blockTypes = contentBlocks
+    .map(function (block) { return block && block.type ? block.type : '不明'; })
+    .join(', ') || 'なし';
+
+  let message = 'Claude APIの応答が空のため、JSONを取得できませんでした。' +
+    '(HTTP ' + responseCode + '、stop_reason: ' + stopReason + '、' +
+    'contentのtype一覧: ' + blockTypes + '、' +
+    'usage: input=' + usage.input_tokens + ' output=' + usage.output_tokens + ')';
+
+  if (stopReason === 'max_tokens') {
+    message += ' ※出力が上限(max_tokens)で途切れたと考えられます。';
+  }
+
+  return message;
 }
 
 /**
  * Claude APIの応答テキストからJSONオブジェクトを取り出す。
  * コードフェンス(```json ... ```)付きの場合や、前後に説明文が付いている場合にも対応する。
  * @param {string} text 応答テキスト
+ * @param {string} [stopReason] レスポンスのstop_reason(エラー文言の補足に使う)
  * @return {Object} 解析したJSONオブジェクト
  */
-function extractJsonFromText(text) {
+function extractJsonFromText(text, stopReason) {
   if (!text) {
     throw new Error('Claude APIの応答が空のため、JSONを取得できませんでした。');
   }
@@ -290,15 +329,36 @@ function extractJsonFromText(text) {
   const firstBrace = candidate.indexOf('{');
   const lastBrace = candidate.lastIndexOf('}');
   if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
-    throw new Error('Claude APIの応答からJSONを取得できませんでした。');
+    throw new Error(buildJsonExtractErrorMessage(text, stopReason));
   }
   candidate = candidate.substring(firstBrace, lastBrace + 1);
 
   try {
     return JSON.parse(candidate);
   } catch (e) {
-    throw new Error('Claude APIの応答のJSON解析に失敗しました。');
+    throw new Error(buildJsonExtractErrorMessage(text, stopReason));
   }
+}
+
+/**
+ * JSON取り出し失敗時のエラーメッセージを組み立てる。
+ * 本文全体は出さず、先頭30字・末尾30字のみを含める。
+ * @param {string} text 応答テキスト
+ * @param {string} [stopReason] レスポンスのstop_reason
+ * @return {string} エラーメッセージ
+ */
+function buildJsonExtractErrorMessage(text, stopReason) {
+  const head = text.substring(0, 30);
+  const tail = text.length > 30 ? text.substring(text.length - 30) : '';
+
+  let message = 'Claude APIの応答のJSON解析に失敗しました。' +
+    '(先頭30字: "' + head + '" / 末尾30字: "' + tail + '")';
+
+  if (stopReason === 'max_tokens') {
+    message += ' ※出力が上限(max_tokens)で途切れたと考えられます。';
+  }
+
+  return message;
 }
 
 /**
