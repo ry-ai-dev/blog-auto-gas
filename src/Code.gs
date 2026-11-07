@@ -5,7 +5,7 @@
  *
  * シート「記事」を使ったブログ記事自動生成・投稿の土台。
  * 段階2: Claude API (Messages API) を呼び出して本文を生成する処理を実装。
- * WordPress への投稿はまだ実装していない。
+ * 段階3: WordPress REST API への下書き保存(DRY_RUN対応)を実装。
  */
 
 // ===== シート・列の定義 =====
@@ -17,11 +17,12 @@ const COL = {
   SUB_KEYWORD: 2,   // B: サブキーワード
   STATUS: 3,        // C: ステータス
   TITLE: 4,         // D: タイトル
-  WP_URL: 5,        // E: WordPress URL
+  WP_URL: 5,        // E: WordPress URL(投稿後のURLを書き込む)
   META_DESCRIPTION: 6, // F: メタディスクリプション
   BODY: 7,          // G: 本文
   CHAR_COUNT: 8,    // H: 文字数
-  ERROR: 9          // I: エラー内容
+  ERROR: 9,         // I: エラー内容
+  POST_ID: 10       // J: WordPress投稿ID(段階3で追加。二重投稿防止に使う)
 };
 
 const HEADER_ROW = 1;
@@ -31,6 +32,7 @@ const STATUS = {
   NOT_GENERATED: '未生成',
   GENERATING: '生成中',
   GENERATED: '生成済み',
+  DRAFT_SAVED: '下書き保存済み',
   POSTED: '投稿済み',
   ERROR: 'エラー'
 };
@@ -63,6 +65,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('記事生成')
     .addItem('選択行の記事を生成', 'generateForSelectedRow')
+    .addItem('WordPressに下書き保存(選択行)', 'postDraftToWordPress')
     .addItem('設定を確認', 'checkSettings')
     .addToUi();
 }
@@ -157,6 +160,226 @@ function generateForSelectedRow() {
   } catch (error) {
     ui.alert('想定外のエラーが発生しました: ' + error.message);
   }
+}
+
+/**
+ * 選択行の記事をWordPressに下書きとして保存する。記事生成とは別操作とし、
+ * 「生成→人が確認→投稿」の流れを保つ。
+ * DRY_RUN が明示的に 'false' でない限り試運転とし、実際の通信は行わない。
+ */
+function postDraftToWordPress() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+    if (!sheet) {
+      ui.alert('エラー: シート「' + SHEET_NAME + '」が見つかりません。');
+      return;
+    }
+
+    const row = sheet.getActiveCell().getRow();
+    if (row <= HEADER_ROW) {
+      ui.alert('ヘッダー行が選択されています。記事の行を選択してください。');
+      return;
+    }
+
+    const status = sheet.getRange(row, COL.STATUS).getValue();
+    if (status !== STATUS.GENERATED) {
+      ui.alert(
+        'ステータスが「' + STATUS.GENERATED + '」ではないため処理を中止しました(現在: 「' + status + '」)。'
+      );
+      return;
+    }
+
+    const title = sheet.getRange(row, COL.TITLE).getValue();
+    if (!title || typeof title !== 'string') {
+      ui.alert('タイトルが空のため処理を中止しました。');
+      return;
+    }
+
+    const bodyHtml = sheet.getRange(row, COL.BODY).getValue();
+    if (!bodyHtml || typeof bodyHtml !== 'string') {
+      ui.alert('本文が空のため処理を中止しました。');
+      return;
+    }
+
+    const existingPostId = sheet.getRange(row, COL.POST_ID).getValue();
+    if (existingPostId) {
+      ui.alert(
+        'この行はすでにWordPressの投稿ID(' + existingPostId + ')が設定されているため、' +
+        '二重投稿防止のため処理を中止しました。'
+      );
+      return;
+    }
+
+    let config;
+    try {
+      config = getWordPressConfig();
+    } catch (configError) {
+      ui.alert('設定エラー: ' + configError.message);
+      return;
+    }
+
+    const metaDescriptionValue = sheet.getRange(row, COL.META_DESCRIPTION).getValue();
+    const excerpt = typeof metaDescriptionValue === 'string' ? metaDescriptionValue : String(metaDescriptionValue || '');
+    const sanitizedHtml = sanitizeContentHtml(bodyHtml);
+
+    if (config.dryRun) {
+      const hostname = extractHostname(config.baseUrl);
+      ui.alert(
+        '【試運転】WordPress下書き投稿の内容確認\n\n' +
+        '送信先ホスト: ' + hostname + '\n' +
+        'タイトル: ' + title + '\n' +
+        '本文の文字数: ' + stripHtmlTags(sanitizedHtml).length + ' 字\n' +
+        'excerptの文字数: ' + excerpt.length + ' 字\n' +
+        'status: draft\n\n' +
+        '※試運転のため投稿していません。(再実行できます)'
+      );
+      return;
+    }
+
+    try {
+      const result = callWordPressCreateDraft(config, title, sanitizedHtml, excerpt);
+      sheet.getRange(row, COL.POST_ID).setValue(result.id);
+      if (result.link) {
+        sheet.getRange(row, COL.WP_URL).setValue(result.link);
+      }
+      updateStatus(sheet, row, STATUS.DRAFT_SAVED);
+
+      ui.alert(
+        'WordPressへの下書き保存が完了しました。\n\n' +
+        '投稿ID: ' + result.id + (result.link ? '\nURL: ' + result.link : '')
+      );
+    } catch (postError) {
+      const safeMessage = truncateErrorMessage(postError.message);
+      updateStatus(sheet, row, STATUS.ERROR, safeMessage);
+      ui.alert('エラーが発生しました: ' + safeMessage);
+    }
+  } catch (error) {
+    ui.alert('想定外のエラーが発生しました: ' + error.message);
+  }
+}
+
+/**
+ * WordPress接続設定をスクリプトプロパティから読み込み、検証する。
+ * DRY_RUN は 'false' が明示されたときのみ本番投稿とし、未設定・不明な値は試運転として扱う。
+ * @return {{baseUrl: string, user: string, password: string, dryRun: boolean}}
+ */
+function getWordPressConfig() {
+  const properties = PropertiesService.getScriptProperties();
+  const rawUrl = properties.getProperty('WP_URL');
+  const user = properties.getProperty('WP_USER');
+  const password = properties.getProperty('WP_APP_PASSWORD');
+  const dryRunValue = properties.getProperty('DRY_RUN');
+
+  if (!rawUrl) {
+    throw new Error('スクリプトプロパティ WP_URL が設定されていません。');
+  }
+  if (rawUrl.indexOf('https://') !== 0) {
+    throw new Error('WP_URL は https:// で始まる必要があります。');
+  }
+  if (!user) {
+    throw new Error('スクリプトプロパティ WP_USER が設定されていません。');
+  }
+  if (!password) {
+    throw new Error('スクリプトプロパティ WP_APP_PASSWORD が設定されていません。');
+  }
+
+  const baseUrl = rawUrl.replace(/\/+$/, '');
+  const dryRun = dryRunValue !== 'false';
+
+  return { baseUrl: baseUrl, user: user, password: password, dryRun: dryRun };
+}
+
+/**
+ * URLからホスト名のみを取り出す(ダイアログ表示用。パス以下は含めない)。
+ * @param {string} url https:// で始まるURL
+ * @return {string} ホスト名
+ */
+function extractHostname(url) {
+  return url.replace(/^https:\/\//, '').split('/')[0];
+}
+
+/**
+ * WordPressに送信する前に、HTML中の危険な要素を取り除く(念のためのサニタイズ)。
+ * <script>・<iframe>・on○○= イベントハンドラ属性を除去する。
+ * @param {string} html 元のHTML
+ * @return {string} サニタイズ後のHTML
+ */
+function sanitizeContentHtml(html) {
+  let sanitized = String(html || '');
+  sanitized = sanitized.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  sanitized = sanitized.replace(/<iframe[^>]*>[\s\S]*?<\/iframe>/gi, '');
+  sanitized = sanitized.replace(/\son\w+\s*=\s*"[^"]*"/gi, '');
+  sanitized = sanitized.replace(/\son\w+\s*=\s*'[^']*'/gi, '');
+  return sanitized;
+}
+
+/**
+ * WordPress REST API (wp/v2/posts) に下書きを作成する。
+ * status は常に 'draft' 固定とし、他の値を渡せないようにする。
+ * @param {{baseUrl: string, user: string, password: string}} config getWordPressConfig() の戻り値
+ * @param {string} title タイトル
+ * @param {string} contentHtml サニタイズ済み本文HTML
+ * @param {string} excerpt 抜粋(メタディスクリプション)
+ * @return {{id: number, link: string}} 作成された投稿のIDとURL
+ */
+function callWordPressCreateDraft(config, title, contentHtml, excerpt) {
+  const endpoint = config.baseUrl + '/wp-json/wp/v2/posts';
+  const credentials = Utilities.base64Encode(config.user + ':' + config.password);
+
+  const payload = {
+    title: title,
+    content: contentHtml,
+    excerpt: excerpt,
+    status: 'draft'
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Basic ' + credentials
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const httpResponse = UrlFetchApp.fetch(endpoint, options);
+  const responseCode = httpResponse.getResponseCode();
+
+  if (responseCode !== 200 && responseCode !== 201) {
+    throw new Error(buildWordPressErrorMessage(responseCode, httpResponse.getContentText()));
+  }
+
+  let responseJson;
+  try {
+    responseJson = JSON.parse(httpResponse.getContentText());
+  } catch (e) {
+    throw new Error('WordPressの応答を解析できませんでした(HTTP ' + responseCode + ')。');
+  }
+
+  return { id: responseJson.id, link: responseJson.link };
+}
+
+/**
+ * WordPress投稿失敗時のエラーメッセージを組み立てる。
+ * レスポンス本文全体やヘッダーは含めず、HTTPステータスと code フィールドのみを含める。
+ * @param {number} responseCode HTTPステータスコード
+ * @param {string} responseText レスポンス本文(codeフィールド抽出のためだけに使う)
+ * @return {string} エラーメッセージ
+ */
+function buildWordPressErrorMessage(responseCode, responseText) {
+  let code = '不明';
+  try {
+    const parsed = JSON.parse(responseText);
+    if (parsed && typeof parsed.code === 'string') {
+      code = parsed.code;
+    }
+  } catch (e) {
+    // 解析できない場合は code を「不明」のままにする(レスポンス本文は出さない)。
+  }
+  return 'WordPressへの投稿に失敗しました(HTTP ' + responseCode + '、code: ' + code + ')。';
 }
 
 /**
