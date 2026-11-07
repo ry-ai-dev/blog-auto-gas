@@ -47,7 +47,7 @@ const REQUIRED_PROPERTY_KEYS = [
 // ===== Claude API 関連の設定(値はスクリプトプロパティから読む) =====
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
 const CLAUDE_MODEL = 'claude-sonnet-5-5';
-const MAX_TOKENS = 6000;
+const MAX_TOKENS = 8000;
 const ANTHROPIC_VERSION = '2023-06-01';
 
 // ===== 生成結果のバリデーション条件 =====
@@ -198,12 +198,15 @@ function buildPrompt(keyword, subKeyword, sampleArticle) {
     '【構成】\n' +
     '1. タイトル\n' +
     '2. 導入文(約300字)\n' +
-    '3. 見出し(H2)を3つ、それぞれ本文を付ける\n' +
-    '4. まとめ(約200字)';
+    '3. 見出し(H2)を4〜6個、それぞれ本文を付ける(H3は多用しない)\n' +
+    '4. まとめ(約200字、必ず最後まで書き切る)';
 
   const constraintsSection =
     '【制約】\n' +
-    '- 本文全体(HTMLタグを除く)は2,000〜3,000字にすること\n' +
+    '- 本文全体(HTMLタグを除く)は2,000〜2,800字を目安にすること\n' +
+    '- 見出し(h2)は4〜6個とし、h3は多用しないこと\n' +
+    '- 表(table)は使わず、段落(p)とリスト(ul/ol)で書くこと\n' +
+    '- 出力が途中で切れないよう、必ず「まとめ」まで書き切ること\n' +
     '- メインキーワード「' + keyword + '」' +
     (subKeyword ? '、サブキーワード「' + subKeyword + '」' : '') +
     'を不自然にならない範囲で本文に含めること\n' +
@@ -211,7 +214,7 @@ function buildPrompt(keyword, subKeyword, sampleArticle) {
     '- 法令・統計・数値などは断定的に書きすぎないこと(例:「〜とされています」のような柔らかい表現を使う)\n\n' +
     '以下のJSON形式のみを出力してください。JSON以外の説明文やコードフェンスは付けないでください。\n' +
     '{"title": "...", "meta_description": "...(120字以内)", ' +
-    '"content_html": "...(h2, p などのHTMLタグを使った本文)"}';
+    '"content_html": "...(h2, p, ul などのHTMLタグを使った本文。tableは使わない)"}';
 
   return roleSection + '\n\n' + sampleSection + '\n\n' + structureSection + '\n\n' + constraintsSection;
 }
