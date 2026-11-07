@@ -226,11 +226,22 @@ function postDraftToWordPress() {
 
     if (config.dryRun) {
       const hostname = extractHostname(config.baseUrl);
+      const bodyPlainText = stripHtmlTags(sanitizedHtml);
+
+      // 認証ヘッダー・ユーザー名・パスワードは出さない。送信内容の確認用のみ。
+      Logger.log(
+        '[WordPress試運転] title: ' + title + '\n' +
+        'status: draft\n' +
+        'excerpt: ' + excerpt + '\n' +
+        '本文の文字数: ' + bodyPlainText.length + ' 字\n' +
+        '本文の先頭100字: ' + bodyPlainText.substring(0, 100)
+      );
+
       ui.alert(
         '【試運転】WordPress下書き投稿の内容確認\n\n' +
         '送信先ホスト: ' + hostname + '\n' +
         'タイトル: ' + title + '\n' +
-        '本文の文字数: ' + stripHtmlTags(sanitizedHtml).length + ' 字\n' +
+        '本文の文字数: ' + bodyPlainText.length + ' 字\n' +
         'excerptの文字数: ' + excerpt.length + ' 字\n' +
         'status: draft\n\n' +
         '※試運転のため投稿していません。(再実行できます)'
@@ -421,13 +432,13 @@ function buildPrompt(keyword, subKeyword, sampleArticle) {
     '【構成】\n' +
     '1. タイトル\n' +
     '2. 導入文(約300字)\n' +
-    '3. 見出し(H2)を4〜6個、それぞれ本文を付ける(H3は多用しない)\n' +
+    '3. 見出し(H2)を3つ、それぞれ本文を付ける(H3は必要な場合のみ少なく使う)\n' +
     '4. まとめ(約200字、必ず最後まで書き切る)';
 
   const constraintsSection =
     '【制約】\n' +
-    '- 本文全体(HTMLタグを除く)は2,000〜2,800字を目安にすること\n' +
-    '- 見出し(h2)は4〜6個とし、h3は多用しないこと\n' +
+    '- 本文全体(HTMLタグを除く)は2,000〜3,000字にすること\n' +
+    '- 見出し(H2)は3つとし、H3は必要な場合のみ少なく使うこと\n' +
     '- 表(table)は使わず、段落(p)とリスト(ul/ol)で書くこと\n' +
     '- 出力が途中で切れないよう、必ず「まとめ」まで書き切ること\n' +
     '- メインキーワード「' + keyword + '」' +
